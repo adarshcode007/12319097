@@ -316,36 +316,70 @@ To make this reliable and fast, we must use a **Producer-Consumer** pattern with
 3.  **Idempotency:** Each task includes a unique ID to ensure students never get the same notification twice.
 4.  **Automatic Retries:** If an email fails, the queue automatically retries it with "exponential backoff".
 
-### 4. Revised Pseudocode
+### 4. Revised JavaScript Implementation
+Using `async/await` and a queue-based approach (e.g., BullMQ) to handle 50,000 students efficiently.
 
-```python
-# PRODUCER: Triggered by HR Action
-def notify_all_api(student_ids, message):
-    # 1. Register the bulk event in DB for tracking
-    batch_id = db.create_batch_record(message)
+```javascript
+/**
+ * PRODUCER: Triggered by HR "Notify All" action.
+ * Distributes tasks to a background queue to avoid blocking the main thread.
+ */
+async function notifyAll(studentIds, message) {
+    const batchId = await db.saveBatchRecord(message);
+    
+    // Instead of a for-loop that waits for each email, 
+    // we bulk-add to a queue. This takes milliseconds.
+    const jobs = studentIds.map(id => ({
+        name: 'send_notification',
+        data: { studentId: id, message, batchId },
+        opts: { attempts: 3, backoff: { type: 'exponential', delay: 1000 } }
+    }));
 
-    # 2. Quickly push tasks to Queue (Non-blocking)
-    for student_id in student_ids:
-        notification_queue.push({
-            "batch_id": batch_id,
-            "student_id": student_id,
-            "message": message,
-            "retry_count": 0
-        })
+    await notificationQueue.addBulk(jobs);
+    
+    return { status: "Processing", batchId };
+}
 
-    return {"status": "Processing started", "batch_id": batch_id}
-
-# CONSUMER: Independent Background Worker
-async def process_notification_task(task):
-    try:
-        # Perform actions in parallel or as a single unit
-        await save_to_db(task.student_id, task.message)
-        await push_to_app(task.student_id, task.message)
-        await send_email(task.student_id, task.message)
-    except Exception as e:
-        if task.retry_count < 3:
-            # Re-queue with incremented retry count
-            notification_queue.retry(task)
-        else:
-            log_fatal_error(task, e)
+/**
+ * CONSUMER: Independent worker process.
+ * Handles the actual delivery and persistence logic.
+ */
+worker.on('completed', async (job) => {
+    const { studentId, message } = job.data;
+    
+    try {
+        // Use Promise.all to perform local operations concurrently
+        await Promise.all([
+            saveToDb(studentId, message),
+            pushToApp(studentId, message)
+        ]);
+        
+        // Third-party API call (potential failure point)
+        await sendEmail(studentId, message);
+        
+    } catch (error) {
+        // Log error using mandatory middleware
+        await Log('backend', 'error', 'service', `Notify Fail for ${studentId}: ${error.message}`);
+        throw error; // Let the queue handle the retry
+    }
+});
 ```
+
+---
+
+# Stage 6
+
+## Priority Inbox Efficiency
+
+To maintain the **Top 10** notifications efficiently as new notifications arrive, I suggest the following strategy:
+
+### 1. Data Structure: Min-Heap (Priority Queue)
+Instead of re-sorting the entire dataset (which is O(N log N)) every time a new notification arrives, we can use a **Min-Heap** of size 10.
+*   **Logic:** The heap will always store the 10 most "important" notifications. The "least important" of these top 10 is at the root.
+*   **Efficiency:** When a new notification arrives, we compare it to the root of the heap. If it's more important, we replace the root and "re-heapify". This operation is **O(log 10)**, which is essentially constant time.
+
+### 2. Backend Strategy: Redis Sorted Sets (ZSET)
+In a real production environment, we can use **Redis Sorted Sets**:
+*   **Score Calculation:** Assign a score to each notification based on its weight and timestamp:
+    `Score = (Weight * 10^12) + Timestamp`
+*   **Maintenance:** Use `ZADD` to add new notifications and `ZREMRANGEBYRANK` to keep only the top 10. This ensures the "Top 10" is always pre-calculated and can be fetched in **O(1)** time.
