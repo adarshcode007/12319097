@@ -212,3 +212,33 @@ WHERE notification_type = 'Placement'
   AND created_at >= NOW() - INTERVAL '7 days';
 ```
 *(Assumes `notification_type` is an enum and `created_at` is indexed).*
+
+---
+
+# Stage 4
+
+## Load Handling & UX
+
+### 1. Proposed Solutions to Improve Performance
+To prevent the database from being overwhelmed when 50,000 students fetch notifications simultaneously, I suggest the following multi-layered approach:
+
+#### **A. Redis Caching (Read-Aside Pattern)**
+Instead of hitting the DB on every page load, store the latest 10-20 notifications and the "Unread Count" in a fast, in-memory Redis cache.
+*   **Workflow:** App checks Redis first. If the data is missing (Cache Miss), it fetches from the DB and populates the cache. When a new notification arrives, the cache is invalidated or updated.
+
+#### **B. Cursor-based Pagination**
+Never fetch "all" notifications. Use cursor-based pagination (e.g., `WHERE created_at < 'last_seen_timestamp' LIMIT 15`) to fetch notifications in small, manageable chunks.
+
+#### **C. Debouncing & Pull-to-Refresh**
+On the frontend, avoid automatic fetching on every single page navigation. Use a "Pull-to-Refresh" pattern or only fetch when the user explicitly clicks the "Notification Bell".
+
+### 2. Tradeoffs Analysis
+
+| Strategy | Pros | Cons |
+| :--- | :--- | :--- |
+| **Redis Caching** | Extremely fast (sub-millisecond) reads; significantly reduces DB load. | Added infrastructure complexity; risk of "Stale Data" if cache invalidation logic fails. |
+| **Cursor Pagination** | Consistent performance regardless of deep scrolling; avoids the "Offset" performance penalty in SQL. | Slightly more complex frontend logic; doesn't support jumping to a specific page number. |
+| **WebSockets/SSE** | Eliminates the need for "polling" (constant fetching); provides a superior real-time UX. | High memory usage on the server (maintaining 50,000 open connections); requires a Load Balancer that supports sticky sessions. |
+
+### 3. Recommendation
+For a campus environment, I recommend **Redis Caching** combined with **Cursor-based Pagination**. This ensures that the initial page load is nearly instantaneous while keeping the database load predictable even during "Placement Season" peaks.
